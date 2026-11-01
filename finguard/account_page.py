@@ -16,6 +16,9 @@ def _logout_after_password_change(notice: str) -> None:
     st.session_state.auth_user_id = None
     st.session_state.auth_authenticated_at = None
     st.session_state.auth_last_seen_at = None
+    st.session_state.auth_browser_session_id = None
+    st.session_state.auth_session_touched_at = None
+    st.session_state.auth_cookie_clear_pending = True
     st.session_state.auth_notice = notice
     st.session_state.current_page = "home"
     st.rerun()

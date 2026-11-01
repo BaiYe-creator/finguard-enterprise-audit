@@ -27,6 +27,7 @@ BACKUP_TABLES = (
     "case_artifacts",
     "audit_logs",
     "auth_tokens",
+    "browser_sessions",
     "rule_profiles",
     "ai_usage_events",
 )
@@ -179,6 +180,20 @@ class PostgresWorkspaceStore(WorkspaceStore):
                     used_at TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS browser_sessions (
+                    id TEXT PRIMARY KEY,
+                    member_id TEXT NOT NULL REFERENCES members(id),
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at DOUBLE PRECISION NOT NULL,
+                    last_seen_at DOUBLE PRECISION NOT NULL,
+                    expires_at DOUBLE PRECISION NOT NULL,
+                    revoked_at DOUBLE PRECISION,
+                    user_agent TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_browser_sessions_token
+                    ON browser_sessions(token_hash);
+                CREATE INDEX IF NOT EXISTS idx_browser_sessions_member
+                    ON browser_sessions(member_id, expires_at DESC);
                 CREATE TABLE IF NOT EXISTS rule_profiles (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL REFERENCES organizations(id),
@@ -216,6 +231,7 @@ class PostgresWorkspaceStore(WorkspaceStore):
                 "audit_cases",
                 "case_artifacts",
                 "audit_logs",
+                "browser_sessions",
                 "rule_profiles",
                 "ai_usage_events",
             ):

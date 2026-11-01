@@ -14,6 +14,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from finguard.account_page import render_account_page
 from finguard.account_security import AccountSecurityService
@@ -81,6 +82,7 @@ st.set_page_config(
 UI = FinGuardUI()
 UI.inject_styles()
 MAGNIFIER_PATH = Path(__file__).resolve().parent / "assets" / "magnifier.png"
+SESSION_COOKIE_NAME = "finguard_session"
 
 FEEDBACK_PATH = Path(
     os.environ.get(
@@ -215,6 +217,127 @@ def _auth_required() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _session_limits() -> tuple[int, int]:
+    try:
+        absolute_hours = max(1, int(_secret("FINGUARD_SESSION_HOURS", "8")))
+        idle_minutes = max(5, int(_secret("FINGUARD_IDLE_MINUTES", "30")))
+    except ValueError:
+        absolute_hours, idle_minutes = 8, 30
+    return absolute_hours, idle_minutes
+
+
+def _empty_auth_context() -> AuthContext:
+    return AuthContext(
+        organization_id="",
+        organization_name="",
+        user_id="",
+        display_name="",
+        role="viewer",
+        username="",
+    )
+
+
+def _clear_auth_state(*, notice: str = "") -> None:
+    session_id = str(st.session_state.get("auth_browser_session_id", "") or "")
+    if session_id:
+        try:
+            _identity_service(str(WORKSPACE_DB_PATH)).revoke_browser_session(session_id)
+        except Exception:
+            pass
+    st.session_state.auth_user_id = None
+    st.session_state.auth_authenticated_at = None
+    st.session_state.auth_last_seen_at = None
+    st.session_state.auth_browser_session_id = None
+    st.session_state.auth_session_touched_at = None
+    st.session_state.auth_cookie_clear_pending = True
+    if notice:
+        st.session_state.auth_notice = notice
+
+
+def _establish_auth_session(context: AuthContext) -> None:
+    identity = _identity_service(str(WORKSPACE_DB_PATH))
+    absolute_hours, _ = _session_limits()
+    try:
+        user_agent = str(st.context.headers.get("user-agent", ""))
+    except Exception:
+        user_agent = ""
+    token, session = identity.create_browser_session(
+        context.user_id,
+        ttl_seconds=absolute_hours * 3600,
+        user_agent=user_agent,
+    )
+    now = time.time()
+    st.session_state.auth_user_id = context.user_id
+    st.session_state.auth_authenticated_at = float(session.get("created_at", now))
+    st.session_state.auth_last_seen_at = now
+    st.session_state.auth_browser_session_id = str(session.get("id", "") or "")
+    st.session_state.auth_session_touched_at = now
+    st.session_state.auth_pending_cookie_token = token
+    st.session_state.auth_cookie_clear_pending = False
+
+
+def _restore_auth_session(identity: IdentityService) -> None:
+    if st.session_state.get("auth_user_id") or st.session_state.get("auth_cookie_checked"):
+        return
+    st.session_state.auth_cookie_checked = True
+    try:
+        token = str(st.context.cookies.get(SESSION_COOKIE_NAME, "") or "").strip()
+    except Exception:
+        token = ""
+    if not token:
+        return
+    _, idle_minutes = _session_limits()
+    restored = identity.restore_browser_session(token, idle_minutes=idle_minutes)
+    if restored is None:
+        st.session_state.auth_cookie_clear_pending = True
+        return
+    context, session = restored
+    now = time.time()
+    st.session_state.auth_user_id = context.user_id
+    st.session_state.auth_authenticated_at = float(session.get("created_at", now))
+    st.session_state.auth_last_seen_at = now
+    st.session_state.auth_browser_session_id = str(session.get("id", "") or "")
+    st.session_state.auth_session_touched_at = now
+
+
+def _render_pending_cookie_change() -> None:
+    clear_pending = bool(st.session_state.get("auth_cookie_clear_pending"))
+    token = str(st.session_state.pop("auth_pending_cookie_token", "") or "")
+    if not clear_pending and not token:
+        return
+    absolute_hours, _ = _session_limits()
+    if clear_pending:
+        cookie_value = (
+            f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax"
+        )
+        st.session_state.auth_cookie_clear_pending = False
+    else:
+        cookie_value = (
+            f"{SESSION_COOKIE_NAME}={token}; Path=/; Max-Age={absolute_hours * 3600}; "
+            "SameSite=Lax"
+        )
+    encoded_cookie = json.dumps(cookie_value)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const value = {encoded_cookie};
+          document.cookie = value;
+          try {{
+            const parentWindow = window.parent;
+            const secure = parentWindow.location.protocol === "https:" ? "; Secure" : "";
+            parentWindow.document.cookie = value + secure;
+          }} catch (error) {{
+            // The cookie is still applied in the component origin.
+          }}
+        }})();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
 def _current_user() -> AuthContext:
     identity = _identity_service(str(WORKSPACE_DB_PATH))
     if not _auth_required():
@@ -224,11 +347,7 @@ def _current_user() -> AuthContext:
         now = time.time()
         authenticated_at = st.session_state.get("auth_authenticated_at")
         last_seen_at = st.session_state.get("auth_last_seen_at")
-        try:
-            absolute_hours = max(1, int(_secret("FINGUARD_SESSION_HOURS", "8")))
-            idle_minutes = max(5, int(_secret("FINGUARD_IDLE_MINUTES", "30")))
-        except ValueError:
-            absolute_hours, idle_minutes = 8, 30
+        absolute_hours, idle_minutes = _session_limits()
         expired = (
             authenticated_at is None
             or last_seen_at is None
@@ -236,30 +355,23 @@ def _current_user() -> AuthContext:
             or now - float(last_seen_at) > idle_minutes * 60
         )
         if expired:
-            st.session_state.auth_user_id = None
+            _clear_auth_state(notice="登录已过期，请重新登录。")
             st.session_state.session_user_id = None
-            st.session_state.auth_notice = "登录已过期，请重新登录。"
-            return AuthContext(
-                organization_id="",
-                organization_name="",
-                user_id="",
-                display_name="",
-                role="viewer",
-                username="",
-            )
+            return _empty_auth_context()
         context = identity.get_context(user_id)
         if context is not None:
             st.session_state.auth_last_seen_at = now
+            touched_at = float(st.session_state.get("auth_session_touched_at", 0) or 0)
+            session_id = str(st.session_state.get("auth_browser_session_id", "") or "")
+            if session_id and now - touched_at >= 300:
+                try:
+                    identity.touch_browser_session(session_id)
+                except Exception:
+                    pass
+                st.session_state.auth_session_touched_at = now
             return context
-        st.session_state.auth_user_id = None
-    return AuthContext(
-        organization_id="",
-        organization_name="",
-        user_id="",
-        display_name="",
-        role="viewer",
-        username="",
-    )
+        _clear_auth_state()
+    return _empty_auth_context()
 
 
 def _active_workspace_case() -> dict[str, Any] | None:
@@ -395,6 +507,11 @@ def _initialize_state() -> None:
         "auth_user_id": None,
         "auth_authenticated_at": None,
         "auth_last_seen_at": None,
+        "auth_browser_session_id": None,
+        "auth_session_touched_at": None,
+        "auth_cookie_checked": False,
+        "auth_cookie_clear_pending": False,
+        "auth_pending_cookie_token": "",
         "auth_notice": "",
         "auth_access_error": "",
         "session_user_id": None,
@@ -428,6 +545,11 @@ def _reset_user_scoped_state() -> None:
         "auth_user_id",
         "auth_authenticated_at",
         "auth_last_seen_at",
+        "auth_browser_session_id",
+        "auth_session_touched_at",
+        "auth_cookie_checked",
+        "auth_cookie_clear_pending",
+        "auth_pending_cookie_token",
         "session_user_id",
         "auth_notice",
         "auth_access_error",
@@ -441,9 +563,7 @@ def _reset_user_scoped_state() -> None:
 
 
 def _logout_user() -> None:
-    st.session_state.auth_user_id = None
-    st.session_state.auth_authenticated_at = None
-    st.session_state.auth_last_seen_at = None
+    _clear_auth_state()
     st.session_state.session_user_id = None
     _reset_user_scoped_state()
 
@@ -1855,6 +1975,7 @@ def _load_query_dataset() -> None:
 
 
 _initialize_state()
+_render_pending_cookie_change()
 try:
     st.session_state.daily_backup = _ensure_daily_backup(pd.Timestamp.now().strftime("%Y%m%d"))
 except Exception as exc:
@@ -1863,16 +1984,22 @@ identity_service = _identity_service(str(WORKSPACE_DB_PATH))
 auth_required = _auth_required()
 current_user: AuthContext | None = None
 if auth_required:
+    _restore_auth_session(identity_service)
     auth_user_id = str(st.session_state.get("auth_user_id", "") or "")
     if auth_user_id:
-        current_user = identity_service.get_context(auth_user_id)
+        resolved_user = _current_user()
+        current_user = resolved_user if resolved_user.user_id else None
         if current_user is None:
             st.session_state.auth_user_id = None
 else:
     current_user = identity_service.local_admin()
 
 if auth_required and current_user is None:
-    render_auth_page(identity_service, _account_security_service())
+    render_auth_page(
+        identity_service,
+        _account_security_service(),
+        on_authenticated=_establish_auth_session,
+    )
 else:
     assert current_user is not None
     if st.session_state.get("session_user_id") != current_user.user_id:

@@ -189,6 +189,24 @@ class WorkspaceStore:
                 CREATE INDEX IF NOT EXISTS idx_auth_tokens_member_created
                     ON auth_tokens(member_id, purpose, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS browser_sessions (
+                    id TEXT PRIMARY KEY,
+                    member_id TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    user_agent TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (member_id) REFERENCES members(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_browser_sessions_token
+                    ON browser_sessions(token_hash);
+
+                CREATE INDEX IF NOT EXISTS idx_browser_sessions_member
+                    ON browser_sessions(member_id, expires_at DESC);
+
                 CREATE TABLE IF NOT EXISTS rule_profiles (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -677,6 +695,99 @@ class WorkspaceStore:
                     """,
                     (timestamp, str(member_id)),
                 )
+
+    def create_browser_session(
+        self,
+        *,
+        member_id: str,
+        token_hash: str,
+        created_at: float,
+        expires_at: float,
+        user_agent: str = "",
+    ) -> dict[str, Any]:
+        session_id = f"SES-{uuid.uuid4().hex[:20].upper()}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM browser_sessions
+                WHERE expires_at <= ? OR revoked_at IS NOT NULL
+                """,
+                (float(created_at),),
+            )
+            connection.execute(
+                """
+                INSERT INTO browser_sessions
+                    (id, member_id, token_hash, created_at, last_seen_at,
+                     expires_at, revoked_at, user_agent)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    session_id,
+                    str(member_id),
+                    str(token_hash),
+                    float(created_at),
+                    float(created_at),
+                    float(expires_at),
+                    str(user_agent or "")[:512],
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM browser_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return _row_dict(row) or {}
+
+    def get_browser_session_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM browser_sessions
+                WHERE token_hash = ?
+                """,
+                (str(token_hash),),
+            ).fetchone()
+        return _row_dict(row)
+
+    def touch_browser_session(self, session_id: str, seen_at: float) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE browser_sessions
+                SET last_seen_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (float(seen_at), str(session_id)),
+            )
+
+    def revoke_browser_session(self, session_id: str, revoked_at: float | None = None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE browser_sessions
+                SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE id = ?
+                """,
+                (float(revoked_at if revoked_at is not None else time.time()), str(session_id)),
+            )
+
+    def revoke_member_browser_sessions(
+        self,
+        member_id: str,
+        revoked_at: float | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE browser_sessions
+                SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE member_id = ? AND revoked_at IS NULL
+                """,
+                (
+                    float(revoked_at if revoked_at is not None else time.time()),
+                    str(member_id),
+                ),
+            )
 
     def create_case(
         self,

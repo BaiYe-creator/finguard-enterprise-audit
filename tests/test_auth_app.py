@@ -49,6 +49,7 @@ def test_auth_page_login_logout_and_role_based_home(monkeypatch) -> None:
 
         assert not app.exception
         assert app.session_state["auth_user_id"] is not None
+        assert app.session_state["auth_browser_session_id"]
         labels = [button.label for button in app.button]
         assert "7. 审计项目与证据链" in labels
         assert "1. 财务审计" not in labels

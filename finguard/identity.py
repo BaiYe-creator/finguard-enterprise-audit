@@ -245,12 +245,76 @@ class IdentityService:
             password_salt=password_salt,
         )
         self.store.invalidate_auth_tokens(member_id)
+        self.store.revoke_member_browser_sessions(member_id)
 
     def get_context(self, user_id: str) -> AuthContext | None:
         member = self.store.get_member(user_id)
         if member is None or not member.get("active"):
             return None
         return self._context_from_member(member)
+
+    @staticmethod
+    def _session_token_hash(token: str) -> str:
+        return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+    def create_browser_session(
+        self,
+        member_id: str,
+        *,
+        ttl_seconds: int,
+        user_agent: str = "",
+    ) -> tuple[str, dict[str, Any]]:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        session = self.store.create_browser_session(
+            member_id=str(member_id),
+            token_hash=self._session_token_hash(token),
+            created_at=now,
+            expires_at=now + max(300, int(ttl_seconds)),
+            user_agent=user_agent,
+        )
+        return token, session
+
+    def restore_browser_session(
+        self,
+        token: str,
+        *,
+        idle_minutes: int,
+    ) -> tuple[AuthContext, dict[str, Any]] | None:
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            return None
+        session = self.store.get_browser_session_by_token_hash(
+            self._session_token_hash(clean_token)
+        )
+        if session is None:
+            return None
+        now = time.time()
+        revoked = session.get("revoked_at") is not None
+        expired = (
+            revoked
+            or float(session.get("expires_at", 0) or 0) <= now
+            or now - float(session.get("last_seen_at", 0) or 0)
+            > max(5, int(idle_minutes)) * 60
+        )
+        if expired:
+            self.store.revoke_browser_session(str(session["id"]), now)
+            return None
+        context = self.get_context(str(session["member_id"]))
+        if context is None:
+            self.store.revoke_browser_session(str(session["id"]), now)
+            return None
+        self.store.touch_browser_session(str(session["id"]), now)
+        session["last_seen_at"] = now
+        return context, session
+
+    def touch_browser_session(self, session_id: str) -> None:
+        if session_id:
+            self.store.touch_browser_session(str(session_id), time.time())
+
+    def revoke_browser_session(self, session_id: str) -> None:
+        if session_id:
+            self.store.revoke_browser_session(str(session_id))
 
     def list_members(self, user: AuthContext) -> list[dict[str, Any]]:
         if not self.has_permission(user, PERM_WORKSPACE_VIEW):
@@ -309,6 +373,8 @@ class IdentityService:
             active=active,
             organization_id=actor.organization_id,
         )
+        if not active:
+            self.store.revoke_member_browser_sessions(member_id)
         self.store.log_event(
             action="member.updated",
             entity_type="member",

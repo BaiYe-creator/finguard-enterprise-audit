@@ -70,6 +70,18 @@ def _run_browser(base_url: str, screenshot: Path) -> None:
             _wait_text(page, "账号安全")
             _assert_no_app_error(page, "管理员初始化")
 
+            session_cookies = [
+                cookie
+                for cookie in page.context.cookies(base_url)
+                if cookie["name"] == "finguard_session" and cookie["value"]
+            ]
+            if not session_cookies:
+                raise AssertionError("Persistent browser session cookie was not created")
+            page.reload(wait_until="networkidle")
+            _wait_text(page, "账号安全")
+            if page.get_by_label("用户名").count():
+                raise AssertionError("Login page reappeared after browser refresh")
+
             page.get_by_role("button", name="账号安全").click()
             _wait_text(page, "登录邮箱")
             page.get_by_label("验证邮箱").fill("browser@example.com")
@@ -121,6 +133,8 @@ def main() -> int:
             "FINGUARD_DB_PATH": str(database),
             "FINGUARD_BACKUP_DIR": str(backups),
             "FINGUARD_AUTH_REQUIRED": "1",
+            "FINGUARD_USE_POSTGRES": "0",
+            "FINGUARD_DATABASE_URL": "",
             "FINGUARD_EMAIL_DEV_MODE": "1",
             "FINGUARD_DISABLE_AI": "1",
             "SMTP_HOST": "",

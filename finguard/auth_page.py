@@ -5,12 +5,13 @@ from __future__ import annotations
 import base64
 import html
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import streamlit as st
 
 from finguard.account_security import AccountSecurityError, AccountSecurityService
-from finguard.identity import AuthenticationError, IdentityService
+from finguard.identity import AuthContext, AuthenticationError, IdentityService
 
 AUTH_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
 
@@ -306,9 +307,26 @@ def _render_card_header(title: str, description: str) -> None:
     )
 
 
+def _complete_login(
+    context: AuthContext,
+    on_authenticated: Callable[[AuthContext], None] | None,
+    notice: str,
+) -> None:
+    if on_authenticated is not None:
+        on_authenticated(context)
+    else:
+        now = time.time()
+        st.session_state.auth_user_id = context.user_id
+        st.session_state.auth_authenticated_at = now
+        st.session_state.auth_last_seen_at = now
+    st.session_state.auth_notice = notice
+    st.rerun()
+
+
 def _render_login_form(
     identity: IdentityService,
     organizations: list[dict],
+    on_authenticated: Callable[[AuthContext], None] | None,
 ) -> None:
     _render_card_header(
         "登录审计工作台",
@@ -327,19 +345,20 @@ def _render_login_form(
         key="auth_primary",
     )
     if login_clicked:
-        context = identity.authenticate(
-            organization_id=organization_labels[organization_name],
-            username=username,
-            password=password,
-        )
+        with st.spinner("正在验证账号与企业权限…"):
+            context = identity.authenticate(
+                organization_id=organization_labels[organization_name],
+                username=username,
+                password=password,
+            )
         if context is None:
             st.error("企业空间、用户名或密码不正确")
         else:
-            st.session_state.auth_user_id = context.user_id
-            st.session_state.auth_authenticated_at = time.time()
-            st.session_state.auth_last_seen_at = time.time()
-            st.session_state.auth_notice = f"欢迎，{context.display_name}。"
-            st.rerun()
+            _complete_login(
+                context,
+                on_authenticated,
+                f"欢迎，{context.display_name}。",
+            )
     if st.button("忘记密码", width="stretch", key="auth_forgot_password"):
         st.session_state.auth_mode = "forgot"
         st.rerun()
@@ -440,6 +459,7 @@ def _render_forgot_password(
 def render_auth_page(
     identity: IdentityService,
     security: AccountSecurityService,
+    on_authenticated: Callable[[AuthContext], None] | None = None,
 ) -> None:
     _inject_auth_styles()
     organizations = identity.list_organizations()
@@ -525,25 +545,26 @@ def render_auth_page(
                         st.error("两次输入的密码不一致")
                     else:
                         try:
-                            context = identity.create_initial_admin(
-                                organization_name=organization_name,
-                                username=username,
-                                display_name=display_name,
-                                password=password,
-                            )
+                            with st.spinner("正在创建企业空间与管理员账号…"):
+                                context = identity.create_initial_admin(
+                                    organization_name=organization_name,
+                                    username=username,
+                                    display_name=display_name,
+                                    password=password,
+                                )
                         except (AuthenticationError, ValueError) as exc:
                             st.error(str(exc))
                         else:
-                            st.session_state.auth_user_id = context.user_id
-                            st.session_state.auth_authenticated_at = time.time()
-                            st.session_state.auth_last_seen_at = time.time()
-                            st.session_state.auth_notice = "企业空间已创建。"
-                            st.rerun()
+                            _complete_login(
+                                context,
+                                on_authenticated,
+                                "企业空间已创建。",
+                            )
             else:
                 if st.session_state.get("auth_mode") == "forgot":
                     _render_forgot_password(identity, security, organizations)
                 else:
-                    _render_login_form(identity, organizations)
+                    _render_login_form(identity, organizations, on_authenticated)
 
             st.markdown(
                 '<div class="fg-auth-foot">仅授权人员可访问。登录失败不会透露账号是否存在。</div>',
